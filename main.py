@@ -77,16 +77,12 @@ def executar_sistema():
     print("[6] Reserva criada!")
     print("Valor:", reserva.valor_total)
 
-    # 7. Criar partida pública
+    # 7. Tornar a partida pública
     sistema.definir_privacidade(
         atleta, reserva, True
     )
 
-    sistema.participar_partida(
-        atleta, reserva
-    )
-
-    print("[7] Partida pública criada!")
+    print("[7] Partida agora é pública!")
 
     # 8. Comprar créditos
     compra = sistema.comprar_creditos(
