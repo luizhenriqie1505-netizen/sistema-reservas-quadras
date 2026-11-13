@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -160,7 +159,9 @@ class SistemaReservas:
         bloqueio = Bloqueio(inicio, fim, motivo)
         # Atualização 6 — cancela as reservas atingidas e mantém a interdição.
         for reserva in self.reservas:
-            if reserva.quadra == quadra and reserva.sobrepoe(inicio, fim):
+            if (reserva.quadra == quadra
+                    and reserva.status == StatusReserva.ATIVA
+                    and reserva.sobrepoe(inicio, fim)):
                 self._cancelar_com_estorno(reserva)
         quadra.agenda.adicionar_bloqueio(bloqueio)
 
@@ -238,6 +239,12 @@ class SistemaReservas:
             raise ValueError("Reserva já iniciada.")
         if not self.consultar_disponibilidade(reserva.quadra, inicio, fim, ignorar=reserva):
             raise ValueError("Horário indisponível.")
+        for s in reserva.solicitacoes:
+            livres = self.unidades_livres(
+                reserva.quadra, s.equipamento, inicio, fim, ignorar=reserva
+            )
+            if s.quantidade > livres:
+                raise ValueError("Equipamento indisponível no novo horário.")
         novo_total = reserva.quadra.calcular_valor(inicio, fim)
         parcelas = reserva._ratear_valor(novo_total)
         ajustes = []
@@ -364,6 +371,22 @@ class SistemaReservas:
     # EQUIPAMENTOS
     # =========================
 
+    def unidades_livres(self, quadra, equipamento, inicio, fim, *, ignorar=None):
+        total = quadra.estoque_equipamentos.get(equipamento, 0)
+        em_uso = 0
+
+        for r in self.reservas:
+            if r is ignorar or r.quadra != quadra or r.status != StatusReserva.ATIVA:
+                continue
+            if not r.sobrepoe(inicio, fim):
+                continue
+            em_uso += sum(
+                s.quantidade for s in r.solicitacoes
+                if s.equipamento == equipamento
+            )
+
+        return total - em_uso
+
     def solicitar_equipamento(
         self, autor, reserva, equipamento, quantidade
     ):
@@ -371,8 +394,18 @@ class SistemaReservas:
         if autor != reserva.responsavel:
             raise PermissionError("Somente responsável pode solicitar.")
 
-        if reserva.status != StatusReserva.ATIVA or quantidade <= 0:
-            raise ValueError("Reserva inativa ou quantidade inválida.")
+        if reserva.status != StatusReserva.ATIVA:
+            raise ValueError("Reserva não está ativa.")
+
+        if (not isinstance(quantidade, int) or isinstance(quantidade, bool)
+                or quantidade <= 0):
+            raise ValueError("Quantidade deve ser um inteiro positivo.")
+
+        livres = self.unidades_livres(
+            reserva.quadra, equipamento, reserva.inicio, reserva.fim
+        )
+        if quantidade > livres:
+            raise ValueError(f"Apenas {livres} unidade(s) disponível(is).")
 
         solicitacao = SolicitacaoEquipamento(
             len(reserva.solicitacoes) + 1,
@@ -384,7 +417,6 @@ class SistemaReservas:
         return solicitacao
 
     def fornecer_equipamento(self, autor, reserva, solicitacao):
-        self._exigir_conta_ativa(autor)
         if autor != reserva.quadra.supervisor:
             raise PermissionError("Somente supervisor da quadra pode fornecer.")
 
