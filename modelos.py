@@ -71,7 +71,8 @@ class Supervisor(Usuario):
             "gerenciar_quadras",
             "consultar_reservas",
             "fornecer_equipamento",
-            "efetuar_repasse"
+            "interditar_quadra",
+            "avaliar_atleta"
         ]
 
 
@@ -86,6 +87,7 @@ class Atleta(Usuario):
 
     def tem_permissao(self, acao):
         return acao in [
+            "consultar_dados",
             "criar_reserva",
             "cancelar_reserva",
             "reagendar_reserva",
@@ -119,7 +121,8 @@ class FaixaFuncionamento:
 
     def contem(self, inicio, fim):
         return (
-            inicio.weekday() == self.dia_semana
+            inicio.date() == fim.date()
+            and inicio.weekday() == self.dia_semana
             and inicio.time() >= self.abertura
             and fim.time() <= self.fechamento
         )
@@ -143,16 +146,21 @@ class Agenda:
         self.bloqueios.remove(bloqueio)
 
     def permite_periodo(self, inicio, fim):
-        funcionamento = any(
-            faixa.contem(inicio, fim) for faixa in self.faixas
-        )
+        if inicio >= fim or inicio.date() != fim.date():
+            return False
+        if any(b.sobrepoe(inicio, fim) for b in self.bloqueios):
+            return False
 
-        bloqueado = any(
-            bloqueio.sobrepoe(inicio, fim)
-            for bloqueio in self.bloqueios
-        )
-
-        return funcionamento and not bloqueado
+        coberto_ate = inicio.time()
+        faixas = sorted((f for f in self.faixas if f.dia_semana == inicio.weekday()),
+                        key=lambda f: f.abertura)
+        for faixa in faixas:
+            if faixa.abertura > coberto_ate:
+                break
+            coberto_ate = max(coberto_ate, faixa.fechamento)
+            if coberto_ate >= fim.time():
+                return True
+        return False
 
 
 # =========================
@@ -204,7 +212,8 @@ class Quadra:
         self.nome = nome
         self.modalidade = modalidade
         self.capacidade = capacidade
-        self.valor_hora = Decimal(str(valor_hora))
+        self.ativa = True
+        self.definir_preco(valor_hora)
         self.supervisor = supervisor
         self.agenda = Agenda()
         self.equipamentos = []
@@ -221,14 +230,16 @@ class Quadra:
         self.valor_hora = valor
 
     def disponibilizar(self):
-        return True
+        self.ativa = True
+        return self.ativa
 
     def desativar(self):
-        return False
+        self.ativa = False
+        return self.ativa
 
     def calcular_valor(self, inicio, fim):
         horas = Decimal(str((fim - inicio).total_seconds())) / Decimal("3600")
-        return self.valor_hora * horas
+        return (self.valor_hora * horas).quantize(Decimal("0.01"))
 
 
 # =========================
@@ -264,6 +275,8 @@ class Partida:
             self.participantes.append(atleta)
 
     def remover_participante(self, atleta):
+        if self.participantes_fechados:
+            raise ValueError("Lista de participantes fechada.")
         if atleta in self.participantes:
             self.participantes.remove(atleta)
 
@@ -284,7 +297,11 @@ class Reserva:
         self.status = StatusReserva.ATIVA
         self.responsavel = responsavel
         self.quadra = quadra
-        self.partida = None
+        # Atualização 2 — partida privada com o responsável e a capacidade da quadra.
+        self.partida = Partida(False, quadra.capacidade)
+        self.partida.autorizar_participante(responsavel)
+        self.partida.adicionar_participante(responsavel)
+        self.modo_pagamento = None
         self.solicitacoes = []
 
         if inicio >= fim:
@@ -297,19 +314,19 @@ class Reserva:
             and self.status == StatusReserva.ATIVA
         )
 
+    # Atualização 3 — divide os centavos por ID, com sobra na ordem de inscrição.
     def calcular_rateio(self):
-        if self.partida is None or not self.partida.participantes:
+        return self._ratear_valor(self.valor_total)
+
+    def _ratear_valor(self, valor):
+        participantes = self.partida.participantes
+        if not participantes:
             return {}
-
-        valor = self.quadra.calcular_valor(self.inicio, self.fim)
-        quantidade = len(self.partida.participantes)
-        valor_individual = (valor / quantidade).quantize(
-            Decimal("0.01")
-        )
-
+        centavos = int(valor * 100)
+        base, sobra = divmod(centavos, len(participantes))
         return {
-            atleta.nome: valor_individual
-            for atleta in self.partida.participantes
+            atleta.id: Decimal(base + (indice < sobra)).scaleb(-2)
+            for indice, atleta in enumerate(participantes)
         }
 
     def reagendar(self, inicio, fim):
@@ -395,7 +412,8 @@ class Pagamento:
     def estornar(self):
         if self.status != StatusPagamento.PAGO:
             raise ValueError("Pagamento não pode ser estornado.")
-        self.pagador.carteira.creditar(self.valor)
+        if self.valor:
+            self.pagador.carteira.creditar(self.valor)
         self.status = StatusPagamento.ESTORNADO
 
 
@@ -441,10 +459,12 @@ class Denuncia:
 
 
 class Avaliacao:
-    def __init__(self, nota, comentario, autor, quadra):
+    def __init__(self, nota, comentario, supervisor, atleta, reserva):
         if not 1 <= nota <= 5:
             raise ValueError("A nota deve estar entre 1 e 5.")
         self.nota = nota
         self.comentario = comentario
-        self.autor = autor
-        self.quadra = quadra
+        self.supervisor = supervisor
+        self.atleta = atleta
+        self.reserva = reserva
+        self.data = datetime.now()
