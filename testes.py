@@ -366,6 +366,76 @@ class TestesSistemaReservas(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.sistema.participar_partida(Atleta(4, "Ana", "ana@email.com"), reserva)
 
+    def test_pedidos_reservam_unidades_sem_baixa_em_duplicidade(self):
+        reserva = self.reservar()
+        bola = Equipamento(1, "Bola", 3)
+        pedir = self.sistema.solicitar_equipamento
+        primeira = pedir(self.atleta, reserva, bola, 2)
+        self.assertEqual(bola.quantidade_total, 3)
+        self.sistema.fornecer_equipamento(self.supervisor, reserva, primeira)
+        self.assertEqual(bola.quantidade_total, 1)
+        with self.assertRaises(ValueError):
+            pedir(self.atleta, reserva, bola, 2)
+        ultima = pedir(self.atleta, reserva, bola, 1)
+        ultima.cancelar()
+        self.assertEqual(self.sistema.unidades_livres(self.quadra, bola, self.inicio, self.fim), 1)
+        reserva.concluir()
+        self.assertEqual(primeira.status, StatusSolicitacao.DEVOLVIDA)
+        self.assertEqual(bola.quantidade_total, 3)
+        with self.assertRaises(ValueError):
+            primeira.devolver()
+
+    def test_estoque_compartilhado_em_horarios_consecutivos(self):
+        primeira, segunda = self.reservar(), self.reservar(1)
+        bolas = Equipamento(1, "Bolas", 3)
+        for reserva in (primeira, segunda):
+            self.sistema.solicitar_equipamento(self.atleta, reserva, bolas, 2)
+        livres = self.sistema.unidades_livres
+        self.assertEqual(livres(self.quadra, bolas, primeira.inicio, segunda.fim), 1)
+        outra = self.sistema.cadastrar_quadra(self.supervisor, "Anexa", "Futsal", 10, 100)
+        self.sistema.definir_disponibilidade(self.supervisor, outra, self.quadra.agenda.faixas)
+        paralela = self.sistema.criar_reserva(self.atleta, outra, self.inicio, self.fim)
+        with self.assertRaises(ValueError):
+            self.sistema.solicitar_equipamento(self.atleta, paralela, bolas, 2)
+        self.sistema.solicitar_equipamento(self.atleta, paralela, bolas, 1)
+        self.assertEqual(livres(outra, bolas, self.inicio, self.fim), 0)
+        self.assertEqual(livres(outra, bolas, segunda.inicio, segunda.fim), 1)
+
+    def test_reagendamento_soma_pedidos_do_mesmo_equipamento(self):
+        reserva = self.reservar()
+        bola = Equipamento(1, "Bola", 3)
+        pedir = self.sistema.solicitar_equipamento
+        pedir(self.atleta, reserva, bola, 1)
+        extra = pedir(self.atleta, reserva, bola, 1)
+        outra = self.sistema.cadastrar_quadra(self.supervisor, "Anexa", "Futsal", 10, 100)
+        self.sistema.definir_disponibilidade(self.supervisor, outra, self.quadra.agenda.faixas)
+        novo_fim = self.fim + timedelta(hours=1)
+        paralela = self.sistema.criar_reserva(self.atleta, outra, self.fim, novo_fim)
+        pedir(self.atleta, paralela, bola, 2)
+        self.atleta.carteira.creditar(150)
+        pagamento = self.sistema.pagar_reserva(self.atleta, reserva)
+        self.sistema.definir_preco(self.supervisor, self.quadra, 120)
+        with self.assertRaises(ValueError):
+            self.sistema.reagendar_reserva(self.atleta, reserva, self.fim, novo_fim)
+        self.assertEqual((reserva.inicio, reserva.fim), (self.inicio, self.fim))
+        self.assertEqual((reserva.valor_total, pagamento.valor, self.atleta.carteira.saldo), (100, 100, 50))
+        extra.cancelar()
+        self.sistema.reagendar_reserva(self.atleta, reserva, self.fim, novo_fim)
+        self.assertEqual((reserva.inicio, reserva.fim), (self.fim, novo_fim))
+
+    def test_cota_da_quadra_e_supervisor_banido(self):
+        reserva = self.reservar()
+        bola = Equipamento(1, "Bola", 3)
+        self.quadra.estoque_equipamentos[bola] = 1
+        with self.assertRaises(ValueError):
+            self.sistema.solicitar_equipamento(self.atleta, reserva, bola, 2)
+        pedido = self.sistema.solicitar_equipamento(self.atleta, reserva, bola, 1)
+        self.sistema.banir_usuario(self.admin, self.supervisor, "Teste")
+        with self.assertRaises(PermissionError):
+            self.sistema.fornecer_equipamento(self.supervisor, reserva, pedido)
+        self.assertEqual(pedido.status, StatusSolicitacao.SOLICITADA)
+        self.assertEqual(bola.quantidade_total, 3)
+
     # Atualização 10 — avaliação exige supervisor, participação, conclusão e nota válida.
     def test_avaliacao_de_atleta(self):
         reserva = self.reservar()

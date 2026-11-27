@@ -28,6 +28,7 @@ class StatusRepasse(Enum):
 class StatusSolicitacao(Enum):
     SOLICITADA = "Solicitada"
     FORNECIDA = "Fornecida"
+    DEVOLVIDA = "Devolvida"
     CANCELADA = "Cancelada"
 
 

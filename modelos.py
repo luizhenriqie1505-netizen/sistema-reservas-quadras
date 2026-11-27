@@ -1,5 +1,6 @@
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from datetime import datetime, time
 from decimal import Decimal
 
@@ -172,6 +173,7 @@ class Equipamento:
         self.id = id
         self.nome = nome
         self.quantidade_total = quantidade_total
+        self.quantidade_emprestada = 0
 
     def atualizar_quantidade(self, quantidade):
         if self.quantidade_total + quantidade < 0:
@@ -193,11 +195,19 @@ class SolicitacaoEquipamento:
             raise ValueError("Equipamento indisponível.")
 
         self.equipamento.atualizar_quantidade(-self.quantidade)
+        self.equipamento.quantidade_emprestada += self.quantidade
         self.status = StatusSolicitacao.FORNECIDA
+
+    def devolver(self):
+        if self.status != StatusSolicitacao.FORNECIDA:
+            raise ValueError("Somente equipamento fornecido pode ser devolvido.")
+        self.equipamento.atualizar_quantidade(self.quantidade)
+        self.equipamento.quantidade_emprestada -= self.quantidade
+        self.status = StatusSolicitacao.DEVOLVIDA
 
     def cancelar(self):
         if self.status == StatusSolicitacao.FORNECIDA:
-            self.equipamento.atualizar_quantidade(self.quantidade)
+            self.devolver()
         self.status = StatusSolicitacao.CANCELADA
 
 
@@ -217,6 +227,8 @@ class Quadra:
         self.supervisor = supervisor
         self.agenda = Agenda()
         self.equipamentos = []
+        # Limite por quadra, quando houver uma cota para o equipamento.
+        self.estoque_equipamentos = {}
 
     def atualizar(self, nome, modalidade, capacidade):
         self.nome = nome
@@ -314,6 +326,13 @@ class Reserva:
             and self.status == StatusReserva.ATIVA
         )
 
+    def quantidades_solicitadas(self):
+        quantidades = Counter()
+        for pedido in self.solicitacoes:
+            if pedido.status in (StatusSolicitacao.SOLICITADA, StatusSolicitacao.FORNECIDA):
+                quantidades[pedido.equipamento] += pedido.quantidade
+        return quantidades
+
     # Atualização 3 — divide os centavos por ID, com sobra na ordem de inscrição.
     def calcular_rateio(self):
         return self._ratear_valor(self.valor_total)
@@ -343,6 +362,11 @@ class Reserva:
     def concluir(self):
         if self.status != StatusReserva.ATIVA:
             raise ValueError("Reserva não está ativa.")
+        for pedido in self.solicitacoes:
+            if pedido.status == StatusSolicitacao.FORNECIDA:
+                pedido.devolver()
+            elif pedido.status == StatusSolicitacao.SOLICITADA:
+                pedido.cancelar()
         self.status = StatusReserva.CONCLUIDA
 
 

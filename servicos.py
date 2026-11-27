@@ -1,3 +1,4 @@
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal
 
@@ -239,11 +240,11 @@ class SistemaReservas:
             raise ValueError("Reserva já iniciada.")
         if not self.consultar_disponibilidade(reserva.quadra, inicio, fim, ignorar=reserva):
             raise ValueError("Horário indisponível.")
-        for s in reserva.solicitacoes:
+        for equipamento, quantidade in reserva.quantidades_solicitadas().items():
             livres = self.unidades_livres(
-                reserva.quadra, s.equipamento, inicio, fim, ignorar=reserva
+                reserva.quadra, equipamento, inicio, fim, ignorar=reserva
             )
-            if s.quantidade > livres:
+            if quantidade > livres:
                 raise ValueError("Equipamento indisponível no novo horário.")
         novo_total = reserva.quadra.calcular_valor(inicio, fim)
         parcelas = reserva._ratear_valor(novo_total)
@@ -372,20 +373,28 @@ class SistemaReservas:
     # =========================
 
     def unidades_livres(self, quadra, equipamento, inicio, fim, *, ignorar=None):
-        total = quadra.estoque_equipamentos.get(equipamento, 0)
-        em_uso = 0
-
-        for r in self.reservas:
-            if r is ignorar or r.quadra != quadra or r.status != StatusReserva.ATIVA:
+        if inicio >= fim:
+            raise ValueError("O início deve ser anterior ao fim.")
+        capacidade = equipamento.quantidade_total + equipamento.quantidade_emprestada
+        cota = quadra.estoque_equipamentos.get(equipamento, capacidade)
+        movimentos = Counter()
+        pico_na_quadra = 0
+        for reserva in self.reservas:
+            if reserva is ignorar or not reserva.sobrepoe(inicio, fim):
                 continue
-            if not r.sobrepoe(inicio, fim):
-                continue
-            em_uso += sum(
-                s.quantidade for s in r.solicitacoes
-                if s.equipamento == equipamento
-            )
+            quantidade = reserva.quantidades_solicitadas()[equipamento]
+            if quantidade:
+                movimentos[max(inicio, reserva.inicio)] += quantidade
+                movimentos[min(fim, reserva.fim)] -= quantidade
+                # Reservas ativas da mesma quadra nunca coincidem.
+                if reserva.quadra == quadra:
+                    pico_na_quadra = max(pico_na_quadra, quantidade)
 
-        return total - em_uso
+        em_uso = pico = 0
+        for instante in sorted(movimentos):
+            em_uso += movimentos[instante]
+            pico = max(pico, em_uso)
+        return max(0, min(capacidade - pico, cota - pico_na_quadra))
 
     def solicitar_equipamento(
         self, autor, reserva, equipamento, quantidade
@@ -417,9 +426,12 @@ class SistemaReservas:
         return solicitacao
 
     def fornecer_equipamento(self, autor, reserva, solicitacao):
+        self._exigir_conta_ativa(autor)
         if autor != reserva.quadra.supervisor:
             raise PermissionError("Somente supervisor da quadra pode fornecer.")
 
+        if reserva.status != StatusReserva.ATIVA:
+            raise ValueError("Reserva não está ativa.")
         if solicitacao not in reserva.solicitacoes:
             raise ValueError("Solicitação não pertence à reserva.")
 
