@@ -1,22 +1,48 @@
 import sys
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from getpass import getpass
-from datetime import datetime, timedelta, time
+from datetime import date, datetime, timedelta, time
 from decimal import Decimal, InvalidOperation
 
 from armazenamento import abrir_banco, autenticar, carregar, definir_senha, salvar, serializar
-from enums import StatusReserva, StatusSolicitacao
+from enums import StatusSolicitacao
 from modelos import Administrador, Atleta, FaixaFuncionamento, Reserva, Supervisor
 
 
 class SelecaoCancelada(Exception):
-    """O usuário escolheu voltar à tela anterior."""
+    pass
+
+
+_dialogo = ContextVar("dialogo_da_acao", default=None)
+
+
+@contextmanager
+def usar_dialogo(dialogo):
+    token = _dialogo.set(dialogo)
+    try:
+        yield
+    finally:
+        _dialogo.reset(token)
+
+
+def perguntar(mensagem):
+    dialogo = _dialogo.get()
+    return dialogo.perguntar(mensagem) if dialogo else input(mensagem)
+
+
+def informar(*partes):
+    dialogo = _dialogo.get()
+    if dialogo:
+        dialogo.linhas.append(" ".join(map(str, partes)))
+    else:
+        print(*partes)
 
 
 def texto(pergunta):
-    resposta = input(pergunta).strip()
+    resposta = perguntar(pergunta).strip()
     if not resposta:
-        raise ValueError("Preencha o campo.")
+        raise ValueError("Campo obrigatório.")
     return resposta
 
 
@@ -28,19 +54,18 @@ def valor_monetario(pergunta):
 
 
 def ler_senha(mensagem):
+    if _dialogo.get():
+        return _dialogo.get().perguntar(mensagem, senha=True)
     if sys.stdin.isatty():
         return getpass(mensagem)
-    return input(mensagem)
+    return perguntar(mensagem)
 
 
 def dados_de_cadastro(sistema):
-    nome = texto("Nome: ")
-    email = texto("E-mail: ").casefold()
-    if any(u.email.casefold() == email for u in sistema.usuarios):
-        raise ValueError("E-mail já cadastrado.")
+    nome, email = sistema.validar_cadastro(texto("Nome: "), texto("E-mail: "))
     senha = ler_senha("Senha: ")
     if not senha.strip() or senha != ler_senha("Confirme a senha: "):
-        raise ValueError("Informe uma senha e repita a mesma senha na confirmação.")
+        raise ValueError("Senha vazia ou confirmação diferente.")
     return nome, email, senha
 
 
@@ -49,7 +74,7 @@ def periodo(varios_dias=False):
     inicio = datetime.strptime(texto("Início (HH:MM): "), "%H:%M").time()
     data_final = data
     if varios_dias:
-        outra_data = input("Data final (Enter para o mesmo dia): ").strip()
+        outra_data = perguntar(f"Data final [{data:%d/%m/%Y}]: ").strip()
         if outra_data:
             data_final = datetime.strptime(outra_data, "%d/%m/%Y").date()
     fim = datetime.strptime(texto("Fim (HH:MM): "), "%H:%M").time()
@@ -61,7 +86,7 @@ def periodo(varios_dias=False):
 
 
 def ler_faixas():
-    dias = texto("Dias da semana (1=seg, 7=dom, separados por espaço): ")
+    dias = texto("Dias (1=seg, 7=dom), separados por espaço: ")
     dias = sorted({int(dia) for dia in dias.split()})
     if any(dia < 1 or dia > 7 for dia in dias):
         raise ValueError("Use os números de 1 a 7.")
@@ -83,31 +108,87 @@ def cadastrar_quadra(sistema, supervisor):
     return f"Quadra cadastrada: {quadra.nome}."
 
 
-def consultar_e_reservar(sistema, atleta):
-    if not sistema.consultar_quadras():
-        print("Ainda não há quadras cadastradas.")
-        return
-    inicio, fim = periodo()
-    livres = [q for q in sistema.consultar_quadras()
-              if sistema.consultar_disponibilidade(q, inicio, fim)]
-    if not livres:
-        print("Nenhuma quadra livre nesse período.")
-        return
-    for quadra in livres:
-        total = quadra.calcular_valor(inicio, fim)
-        print(f"{quadra.id} - {quadra.nome} ({quadra.modalidade}), total R$ {total:.2f}")
-    escolha = int(texto("ID da quadra para reservar (0 para voltar): "))
-    if escolha == 0:
-        return
-    quadra = next((q for q in livres if q.id == escolha), None)
-    if quadra is None:
-        raise ValueError("Escolha uma quadra da lista.")
+DIAS_DA_SEMANA = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
+
+
+def ler_dia_da_agenda(entrada, hoje):
+    nome = entrada.strip().casefold().removesuffix("-feira")
+    if nome == "hoje":
+        return hoje
+    if nome in ("amanhã", "amanha"):
+        return hoje + timedelta(days=1)
+    nome = {"terca": "terça", "sabado": "sábado"}.get(nome, nome)
+    if nome in DIAS_DA_SEMANA:
+        # Revisão (Luiz) — se hoje é segunda e eu digitar “segunda”, qual data aparece?
+        dias = (DIAS_DA_SEMANA.index(nome) - hoje.weekday()) % 7
+        return hoje + timedelta(days=dias)
+    try:
+        return datetime.strptime(nome, "%d/%m/%Y").date()
+    except ValueError:
+        raise ValueError("Dia ou data inválidos (DD/MM/AAAA).") from None
+
+
+def ler_periodo_da_agenda(entrada, hoje):
+    entrada = entrada.strip().casefold()
+    quantidade = entrada.removesuffix(" dias").strip()
+    if quantidade.isdecimal():
+        dias = int(quantidade)
+        if not 1 <= dias <= (date.max - hoje).days + 1:
+            raise ValueError("Quantidade de dias inválida.")
+        return hoje, hoje + timedelta(days=dias - 1)
+    de, separador, ate = entrada.partition(" a ")
+    primeiro = ler_dia_da_agenda(de, hoje)
+    ultimo = ler_dia_da_agenda(ate, hoje) if separador else primeiro
+    return primeiro, ultimo
+
+
+def mostrar_agenda(sistema, quadra, primeiro=None, ultimo=None):
+    tem_horario = False
+    for dia, faixas in sistema.consultar_agenda(quadra, primeiro, ultimo):
+        horarios = " | ".join(f"{abre:%H:%M}–{fecha:%H:%M}" for abre, fecha in faixas)
+        informar(f"{dia:%d/%m/%Y} ({DIAS_DA_SEMANA[dia.weekday()]}): {horarios or 'sem horários livres'}")
+        if faixas:
+            tem_horario = True
+    return tem_horario
+
+
+def reservar_no_dia(sistema, atleta, quadra, dia, hora):
+    inicio = datetime.combine(dia, datetime.strptime(hora, "%H:%M").time())
+    fim = datetime.combine(dia, datetime.strptime(texto("Fim (HH:MM): "), "%H:%M").time())
+    if not sistema.consultar_disponibilidade(quadra, inicio, fim):
+        raise ValueError("Horário indisponível.")
+    # Revisão (Ronaldo) — escolher pagamento integral aqui já desconta o valor da carteira?
+    informar(f"Total da reserva: R$ {quadra.calcular_valor(inicio, fim):.2f}")
     modos = {"1": "integral", "2": "rateado"}
-    modo = modos.get(texto("Método de pagamento: 1 - Integral, 2 - Rateado: "))
+    modo = modos.get(texto("Pagamento (1 - Integral, 2 - Rateado): "))
     if modo is None:
         raise ValueError("Escolha 1 ou 2.")
     reserva = sistema.criar_reserva(atleta, quadra, inicio, fim, modo)
     return f"Reserva {reserva.id} confirmada para {atleta.nome} em {quadra.nome}."
+
+
+def consultar_agenda(sistema, usuario):
+    atleta = isinstance(usuario, Atleta)
+    quadras = sistema.consultar_quadras(usuario)
+    if not quadras:
+        return "Nenhuma quadra disponível."
+    quadra = quadras[0] if len(quadras) == 1 else selecionar(quadras, descricao_quadra)
+    informar(f"\n{quadra.nome} — próximos 7 dias — R$ {quadra.valor_hora:.2f}/hora")
+    mostrar_agenda(sistema, quadra)
+    dia_para_reserva = None
+    while True:
+        pergunta = "Dia ou período: " if dia_para_reserva is None else "Início ou nova consulta: "
+        entrada = perguntar(pergunta).strip()
+        if not entrada or entrada == "0":
+            return
+        try:
+            if dia_para_reserva is not None and ":" in entrada:
+                return reservar_no_dia(sistema, usuario, quadra, dia_para_reserva, entrada)
+            primeiro, ultimo = ler_periodo_da_agenda(entrada, datetime.now().date())
+            tem_horario = mostrar_agenda(sistema, quadra, primeiro, ultimo)
+            dia_para_reserva = primeiro if atleta and primeiro == ultimo and tem_horario else None
+        except ValueError as erro:
+            informar(erro)
 
 
 def descricao_reserva(reserva):
@@ -124,9 +205,12 @@ def selecionar(itens, descricao, pergunta="ID"):
     por_id = {item.id: item for item in itens}
     if not por_id:
         raise ValueError("Nenhuma opção disponível.")
+    dialogo = _dialogo.get()
+    if dialogo:
+        return dialogo.escolher(tuple(por_id.values()), descricao)
     for chave, item in por_id.items():
-        print(f"{chave} - {descricao(item)}")
-    chave = int(texto(f"{pergunta} (0 para voltar): "))
+        informar(f"{chave} - {descricao(item)}")
+    chave = int(texto(f"0 - Voltar\n{pergunta}: "))
     if chave == 0:
         raise SelecaoCancelada()
     if chave not in por_id:
@@ -135,32 +219,38 @@ def selecionar(itens, descricao, pergunta="ID"):
 
 
 def minhas_reservas(sistema, usuario):
-    partidas = sistema.consultar_partidas(usuario)
-    return [reserva for reserva in sistema.reservas if reserva.partida in partidas]
+    return sistema.consultar_reservas(usuario)
 
 
 def mostrar_reservas(reservas):
     if not reservas:
-        print("Nenhuma reserva nesta lista.")
+        informar("Nenhuma reserva.")
     for reserva in reservas:
-        print(f"{reserva.id} - {descricao_reserva(reserva)}")
+        informar(f"{reserva.id} - {descricao_reserva(reserva)}")
 
 
 def minhas_partidas(sistema, usuario):
     reservas = minhas_reservas(sistema, usuario)
     if not reservas:
-        return "Nenhuma partida neste perfil."
+        return "Nenhuma partida."
     for reserva in reservas:
-        print(f"{reserva.id} - {descricao_reserva(reserva)}")
-        print("Participantes:", ", ".join(atleta.nome for atleta in reserva.partida.participantes))
+        informar(f"{reserva.id} - {descricao_reserva(reserva)}")
+        informar("Participantes:", ", ".join(atleta.nome for atleta in reserva.partida.participantes))
         for pedido in reserva.solicitacoes:
-            print(f"  Material: {pedido.quantidade} x {pedido.equipamento.nome}, {pedido.status.value}")
+            informar(f"  Material: {pedido.quantidade} x {pedido.equipamento.nome}, {pedido.status.value}")
+
+
+def descricao_quadra(quadra):
+    estado = "ativa" if quadra.ativa else "desativada"
+    if any(b.fim_efetivo > datetime.now(b.fim.tzinfo) for b in quadra.agenda.bloqueios):
+        estado += ", com interdição"
+    return f"{quadra.nome} ({estado})"
 
 
 def escolher_quadra(sistema, usuario):
     quadras = [quadra for quadra in sistema.consultar_quadras()
                if isinstance(usuario, Administrador) or quadra.supervisor == usuario]
-    return selecionar(quadras, lambda q: f"{q.nome} ({'ativa' if q.ativa else 'inativa'})")
+    return selecionar(quadras, descricao_quadra)
 
 
 def escolher_reserva(sistema, usuario, participante=False):
@@ -178,7 +268,9 @@ def cadastro_supervisor(sistema, admin):
 
 
 def denunciar(sistema, autor):
-    alvo = selecionar((pessoa for pessoa in sistema.usuarios if pessoa != autor), lambda pessoa: pessoa.nome)
+    alvos = [pessoa for pessoa in sistema.usuarios
+             if pessoa != autor and sistema.permite_denuncia_entre_perfis(autor, pessoa)]
+    alvo = selecionar(alvos, lambda pessoa: f"{pessoa.nome} ({type(pessoa).__name__})")
     denuncia = sistema.registrar_denuncia(autor, alvo, texto("Motivo: "))
     return f"Denúncia {denuncia.id} registrada."
 
@@ -188,14 +280,14 @@ def dados(sistema, autor):
     if isinstance(autor, Administrador):
         alvo = selecionar(sistema.usuarios, lambda pessoa: pessoa.nome)
     for campo, valor in sistema.consultar_dados(autor, alvo).items():
-        print(f"{campo}: {valor}")
+        informar(f"{campo}: {valor}")
 
 
 def banir(sistema, admin):
     alvos = [pessoa for pessoa in sistema.usuarios if isinstance(pessoa, (Supervisor, Atleta))]
     alvo = selecionar(alvos, lambda pessoa: f"{pessoa.nome} ({type(pessoa).__name__})")
     sistema.banir_usuario(admin, alvo, texto("Justificativa: "))
-    return f"Conta de {alvo.nome} banida. Histórico preservado."
+    return f"Conta de {alvo.nome} banida."
 
 
 def interditar(sistema, autor):
@@ -212,7 +304,7 @@ def repassar(sistema, admin):
     mostrar_reservas(list(reservas.values()))
     if not reservas:
         return
-    ids = [int(item) for item in texto("IDs das reservas do lote, separados por espaço: ").split()]
+    ids = [int(item) for item in texto("IDs das reservas, separados por espaço: ").split()]
     if any(chave not in reservas for chave in ids):
         raise ValueError("O lote possui reserva inválida.")
     lote = [reservas[chave] for chave in ids]
@@ -233,13 +325,6 @@ def reagendar(sistema, atleta):
     return f"Reserva reagendada: {descricao_reserva(reserva)}."
 
 
-def disponibilidade(sistema, supervisor):
-    quadra = escolher_quadra(sistema, supervisor)
-    if sistema.consultar_disponibilidade(quadra, *periodo()):
-        return "Quadra disponível nesse período."
-    return "Quadra indisponível nesse período."
-
-
 def atualizar_quadra(sistema, supervisor):
     quadra = escolher_quadra(sistema, supervisor)
     nome, modalidade = texto("Nome: "), texto("Modalidade: ")
@@ -251,14 +336,14 @@ def atualizar_quadra(sistema, supervisor):
 def alterar_preco(sistema, supervisor):
     quadra = escolher_quadra(sistema, supervisor)
     sistema.definir_preco(supervisor, quadra, valor_monetario("Novo preço por hora: "))
-    return f"{quadra.nome}: R$ {quadra.valor_hora:.2f} por hora para novas reservas."
+    return f"{quadra.nome}: R$ {quadra.valor_hora:.2f}/hora."
 
 
 def definir_funcionamento(sistema, supervisor):
     quadra = escolher_quadra(sistema, supervisor)
     for faixa in quadra.agenda.faixas:
-        print(f"Dia {faixa.dia_semana + 1}: {faixa.abertura:%H:%M} às {faixa.fechamento:%H:%M}")
-    acao = texto("1 - Acrescentar faixas, 2 - Substituir o funcionamento: ")
+        informar(f"Dia {faixa.dia_semana + 1}: {faixa.abertura:%H:%M} às {faixa.fechamento:%H:%M}")
+    acao = texto("Faixas (1 - Acrescentar, 2 - Substituir): ")
     if acao not in ("1", "2"):
         raise ValueError("Escolha 1 ou 2.")
     faixas = ler_faixas()
@@ -271,14 +356,14 @@ def definir_funcionamento(sistema, supervisor):
 def disponibilizar(sistema, supervisor):
     quadra = escolher_quadra(sistema, supervisor)
     sistema.disponibilizar_quadra(supervisor, quadra)
-    return f"{quadra.nome} está ativa."
+    return f"{quadra.nome} disponível."
 
 
 def excluir_quadra(sistema, supervisor):
     quadra = escolher_quadra(sistema, supervisor)
     sistema.excluir_quadra(supervisor, quadra)
     if quadra in sistema.quadras:
-        return "Quadra desativada. O histórico de reservas foi preservado."
+        return "Quadra desativada."
     return "Quadra excluída."
 
 
@@ -296,15 +381,6 @@ def concluir(sistema, supervisor):
     return f"Reserva {reserva.id} concluída."
 
 
-def avaliar(sistema, supervisor):
-    concluidas = [r for r in minhas_reservas(sistema, supervisor) if r.status == StatusReserva.CONCLUIDA]
-    reserva = selecionar(concluidas, descricao_reserva)
-    atleta = selecionar(reserva.partida.participantes, lambda pessoa: pessoa.nome)
-    nota = int(texto("Nota de 1 a 5: "))
-    sistema.avaliar_atleta(supervisor, atleta, reserva, nota, input("Comentário: "))
-    return f"Avaliação registrada para {atleta.nome}: {nota}/5."
-
-
 def fornecer(sistema, supervisor):
     reserva = escolher_reserva(sistema, supervisor)
     pendentes = [p for p in reserva.solicitacoes if p.status == StatusSolicitacao.SOLICITADA]
@@ -316,7 +392,7 @@ def fornecer(sistema, supervisor):
 def comprar(sistema, atleta):
     valor = valor_monetario("Valor dos créditos (R$): ")
     compra = sistema.comprar_creditos(atleta, valor)
-    confirmacao = texto("Confirmar pagamento simulado? (s/n): ").casefold()
+    confirmacao = texto("Confirmar pagamento simulado (s/n)? ").casefold()
     if confirmacao == "s":
         compra.confirmar()
         return "Créditos adicionados."
@@ -329,7 +405,7 @@ def comprar(sistema, atleta):
 def pagar(sistema, atleta):
     reserva = escolher_reserva(sistema, atleta, participante=True)
     modo = reserva.metodo_pagamento
-    if modo is None:  # Reservas anteriores à escolha do método no cadastro.
+    if modo is None:
         modo = texto("Método (integral/rateado): ").lower()
         if modo not in ("integral", "rateado"):
             raise ValueError("Método inválido.")
@@ -341,7 +417,7 @@ def rateio(sistema, atleta):
     reserva = escolher_reserva(sistema, atleta, participante=True)
     parcelas = sistema.calcular_rateio(reserva)
     for participante in reserva.partida.participantes:
-        print(f"{participante.nome} (ID {participante.id}): R$ {parcelas[participante.id]:.2f}")
+        informar(f"{participante.nome} (ID {participante.id}): R$ {parcelas[participante.id]:.2f}")
 
 
 def privacidade(sistema, atleta):
@@ -359,7 +435,7 @@ def convidar(sistema, responsavel):
                   and p not in reserva.partida.participantes and p not in reserva.partida.autorizados]
     atleta = selecionar(candidatos, lambda pessoa: pessoa.nome)
     sistema.autorizar_participante(responsavel, reserva, atleta)
-    return f"{atleta.nome} poderá usar a opção ‘Entrar em partida ou aceitar convite’."
+    return f"Convite registrado para {atleta.nome}."
 
 
 def listar_publicas(sistema, atleta):
@@ -381,7 +457,6 @@ def solicitar(sistema, atleta):
     return f"Pedido {pedido.id} registrado: {quantidade} x {equipamento.nome}."
 
 
-# Cada opção chama o mesmo serviço usado nos testes, com o usuário autenticado.
 MENUS = {
     Administrador: (
         ("Cadastrar supervisor", cadastro_supervisor),
@@ -397,20 +472,19 @@ MENUS = {
         ("Cancelar reserva", cancelar),
         ("Alterar preço da quadra", alterar_preco),
         ("Interditar quadra", interditar),
-        ("Consultar disponibilidade", disponibilidade),
+        ("Ver agenda e horários livres", consultar_agenda),
         ("Definir funcionamento", definir_funcionamento),
-        ("Disponibilizar quadra", disponibilizar),
+        ("Disponibilizar quadra e retirar interdições", disponibilizar),
         ("Atualizar cadastro da quadra", atualizar_quadra),
-        ("Excluir quadra ou desativar se houver histórico", excluir_quadra),
+        ("Excluir quadra (desativar se houver histórico)", excluir_quadra),
         ("Cadastrar equipamento", cadastrar_material),
         ("Fornecer equipamento", fornecer),
         ("Concluir reserva encerrada", concluir),
-        ("Avaliar atleta", avaliar),
         ("Registrar denúncia", denunciar),
         ("Meus dados", dados),
     ),
     Atleta: (
-        ("Consultar disponibilidade e reservar", consultar_e_reservar),
+        ("Ver agenda, horários livres e reservar", consultar_agenda),
         ("Minhas reservas e partidas", minhas_partidas),
         ("Cancelar reserva", cancelar),
         ("Comprar créditos", comprar),
@@ -460,7 +534,6 @@ def preparar_simulacao(sistema):
     for atleta in (ana, leo):
         sistema.comprar_creditos(atleta, 250).confirmar()
 
-    # Histórico fictício permite demonstrar avaliação e repasse sem esperar uma partida acabar.
     ontem = (datetime.now() - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
     anterior = Reserva(1, ontem, ontem + timedelta(hours=1), ana, quadra)
     anterior.valor_total = quadra.calcular_valor(anterior.inicio, anterior.fim)
@@ -471,21 +544,32 @@ def preparar_simulacao(sistema):
     amanha = ontem + timedelta(days=2)
     atual = sistema.criar_reserva(ana, quadra, amanha, amanha + timedelta(hours=1), "rateado")
     sistema.autorizar_participante(ana, atual, leo)
-    print("\nSIMULAÇÃO TEMPORÁRIA — senha das quatro contas: quadra")
-    print("Administrador: admin@demo | Supervisor: bia@demo | Atletas: ana@demo e leo@demo")
-    print("Reserva 1: concluída e paga, disponível para avaliação e repasse.")
-    print(f"Reserva 2: {amanha:%d/%m/%Y %H:%M}, privada, com convite para Léo.")
-    print("Entre como Léo e aceite o convite. Cada atleta poderá pagar R$ 50.")
 
 
-def executar_sistema(caminho_banco=None, simular=False):
-    conta_id = None
-    print("Sistema de reservas de quadras")
+@contextmanager
+def banco_da_sessao(caminho_banco=None, simular=False):
+    # Revisão (Luiz e Ronaldo) — o que fica salvo quando a simulação termina?
     with closing(abrir_banco(":memory:" if simular else caminho_banco)) as banco:
         if simular:
             versao, sistema = carregar(banco)
             preparar_simulacao(sistema)
             salvar(banco, versao, sistema)
+        yield banco
+
+
+def abrir_interface(simular=False):
+    from interface import abrir_janela
+    with banco_da_sessao(simular=simular) as banco:
+        abrir_janela(banco, simular)
+
+
+def executar_sistema(caminho_banco=None, simular=False):
+    conta_id = None
+    print("Sistema de reservas de quadras")
+    with banco_da_sessao(caminho_banco, simular) as banco:
+        if simular:
+            print("\nSimulação temporária | Senha: quadra")
+            print("Administrador: admin@demo | Supervisor: bia@demo | Atletas: ana@demo e leo@demo")
         try:
             while True:
                 versao, sistema = carregar(banco)
@@ -494,26 +578,23 @@ def executar_sistema(caminho_banco=None, simular=False):
                 try:
                     mensagem = None
                     if not sistema.usuarios:
-                        print("\nPrimeiro acesso: cadastre o administrador do sistema.")
+                        print("\nCadastro do administrador")
                         nome, email, senha = dados_de_cadastro(sistema)
-                        admin = Administrador(1, nome, email)
+                        admin = sistema.cadastrar_administrador_inicial(nome, email)
                         definir_senha(admin, senha)
-                        sistema.usuarios.append(admin)
-                        mensagem = "Administrador cadastrado. Entre com seu e-mail e senha."
+                        mensagem = "Administrador cadastrado."
                     elif usuario is not None and not usuario.banido:
                         conta_id, mensagem = menu_do_perfil(sistema, usuario)
                     else:
                         conta_id = None
-                        opcao = texto("\n1 - Criar conta de atleta\n2 - Entrar com e-mail e senha\n"
-                                      "0 - Encerrar programa\nOpção: ")
+                        opcao = texto("\n1 - Criar conta de atleta\n2 - Entrar\n0 - Encerrar\nOpção: ")
                         if opcao == "0":
                             break
                         if opcao == "1":
                             nome, email, senha = dados_de_cadastro(sistema)
-                            atleta = Atleta(len(sistema.usuarios) + 1, nome, email)
+                            atleta = sistema.cadastrar_atleta(nome, email)
                             definir_senha(atleta, senha)
-                            sistema.usuarios.append(atleta)
-                            mensagem = "Conta criada. Use a opção 2 para entrar."
+                            mensagem = "Conta criada."
                         elif opcao == "2":
                             email = texto("E-mail: ")
                             usuario = autenticar(sistema, email, ler_senha("Senha: "))
@@ -534,15 +615,21 @@ def executar_sistema(caminho_banco=None, simular=False):
 
 
 if __name__ == "__main__":
-    if "--simular" in sys.argv[1:]:
-        executar_sistema(simular=True)
+    if "--gui" in sys.argv[1:]:
+        abrir_interface(simular="--simular" in sys.argv[1:])
+    elif "--simular" in sys.argv[1:]:
+        abrir_interface(simular=True)
     else:
         try:
-            modo = input("1 - Abrir sistema com dados salvos\n2 - Simulação para apresentação\n"
+            modo = input("1 - Sistema com dados salvos\n2 - Simulação gráfica\n3 - Interface gráfica\n"
                          "0 - Sair\nOpção: ").strip()
-            while modo not in ("0", "1", "2"):
-                modo = input("Escolha 0, 1 ou 2: ").strip()
-            if modo != "0":
-                executar_sistema(simular=modo == "2")
+            while modo not in ("0", "1", "2", "3"):
+                modo = input("Opção (0 a 3): ").strip()
+            if modo == "3":
+                abrir_interface()
+            elif modo == "2":
+                abrir_interface(simular=True)
+            elif modo == "1":
+                executar_sistema()
         except (EOFError, KeyboardInterrupt):
             print("Programa encerrado.")

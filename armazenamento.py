@@ -1,4 +1,3 @@
-"""Armazenamento local da sessão e autenticação dos usuários do terminal."""
 import hashlib
 import hmac
 import json
@@ -14,6 +13,10 @@ import modelos
 from servicos import SistemaReservas
 
 
+class ConflitoDeVersao(ValueError):
+    pass
+
+
 def definir_senha(usuario, senha):
     if not senha.strip():
         raise ValueError("A senha não pode ser vazia.")
@@ -27,6 +30,7 @@ def derivar_senha(senha, sal):
 
 
 def autenticar(sistema, email, senha):
+    # Revisão (Luiz) — o login reconhece o mesmo e-mail digitado com maiúsculas?
     conta = next((u for u in sistema.usuarios if u.email.casefold() == email.casefold()), None)
     if conta is None or not hmac.compare_digest(
         derivar_senha(senha, bytes.fromhex(conta._sal)), conta._verificador
@@ -35,8 +39,6 @@ def autenticar(sistema, email, senha):
     return conta
 
 
-# A reserva e o pagamento precisam apontar para a mesma carteira após reabrir.
-# Os índices abaixo preservam as referências compartilhadas entre os objetos.
 CLASSES = {classe.__name__: classe for classe in (
     SistemaReservas, modelos.Administrador, modelos.Supervisor, modelos.Atleta,
     modelos.Carteira, modelos.Quadra, modelos.Agenda, modelos.FaixaFuncionamento,
@@ -128,7 +130,8 @@ def carregar(banco):
 
 def salvar(banco, versao, sistema):
     with banco:
+        # Revisão (Ronaldo) — um segundo terminal consegue sobrescrever uma versão mais recente?
         resultado = banco.execute("UPDATE sistema SET versao=versao+1, dados=? "
                                   "WHERE id=1 AND versao=?", (serializar(sistema), versao))
         if resultado.rowcount != 1:
-            raise ValueError("Outra sessão alterou os dados. Repita a operação.")
+            raise ConflitoDeVersao("Outra sessão alterou os dados. Confira a lista e repita a operação.")

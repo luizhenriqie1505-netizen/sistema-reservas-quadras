@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from datetime import datetime, time
 from decimal import Decimal
+from itertools import chain
 
 from enums import (
     StatusReserva,
@@ -13,10 +14,6 @@ from enums import (
     StatusDenuncia
 )
 
-
-# =========================
-# USUARIOS - CLASSE ABSTRATA
-# =========================
 
 class Usuario(ABC):
     def __init__(self, id, nome, email):
@@ -74,7 +71,7 @@ class Supervisor(Usuario):
             "atualizar_quadra", "excluir_quadra", "definir_preco", "disponibilizar_quadra",
             "definir_disponibilidade", "consultar_disponibilidade", "consultar_reservas",
             "consultar_partidas", "cancelar_reserva", "interditar_quadra", "concluir_reserva",
-            "cadastrar_equipamento", "fornecer_equipamento", "avaliar_atleta",
+            "cadastrar_equipamento", "fornecer_equipamento",
         }
 
 
@@ -97,18 +94,35 @@ class Atleta(Usuario):
         }
 
 
-# =========================
-# AGENDA E FUNCIONAMENTO
-# =========================
+def _horario_no_fuso(horario, fuso):
+    if horario.tzinfo == fuso:
+        return horario
+    convertido = horario.astimezone(fuso)
+    return convertido if fuso is not None else convertido.replace(tzinfo=None)
+
+
+def _intersecao(inicio, fim, de, ate):
+    inicio_comum = max(inicio, _horario_no_fuso(de, inicio.tzinfo))
+    fim_comum = min(fim, _horario_no_fuso(ate, inicio.tzinfo))
+    if inicio_comum < fim_comum:
+        return inicio_comum, fim_comum
+    return None
+
 
 class Bloqueio:
     def __init__(self, inicio, fim, motivo):
         self.inicio = inicio
         self.fim = fim
         self.motivo = motivo
+        self.liberado_em = None
+
+    @property
+    def fim_efetivo(self):
+        liberado_em = getattr(self, "liberado_em", None)
+        return min(self.fim, liberado_em) if liberado_em is not None else self.fim
 
     def sobrepoe(self, inicio, fim):
-        return inicio < self.fim and fim > self.inicio
+        return _intersecao(inicio, fim, self.inicio, self.fim_efetivo) is not None
 
 
 class FaixaFuncionamento:
@@ -146,27 +160,49 @@ class Agenda:
     def remover_bloqueio(self, bloqueio):
         self.bloqueios.remove(bloqueio)
 
-    def permite_periodo(self, inicio, fim):
+    def horarios_livres(self, inicio, fim, ocupados=()):
         if inicio >= fim or inicio.date() != fim.date():
-            return False
-        if any(b.sobrepoe(inicio, fim) for b in self.bloqueios):
-            return False
+            return []
 
-        coberto_ate = inicio.time()
-        faixas = sorted((f for f in self.faixas if f.dia_semana == inicio.weekday()),
-                        key=lambda f: f.abertura)
-        for faixa in faixas:
-            if faixa.abertura > coberto_ate:
-                break
-            coberto_ate = max(coberto_ate, faixa.fechamento)
-            if coberto_ate >= fim.time():
-                return True
-        return False
+        funcionamento = []
+        do_dia = (f for f in self.faixas if f.dia_semana == inicio.weekday())
+        for faixa in sorted(do_dia, key=lambda f: f.abertura):
+            abre = max(inicio, datetime.combine(inicio.date(), faixa.abertura, inicio.tzinfo))
+            fecha = min(fim, datetime.combine(inicio.date(), faixa.fechamento, inicio.tzinfo))
+            if abre >= fecha:
+                continue
+            if funcionamento and abre <= funcionamento[-1][1]:
+                anterior, fechamento = funcionamento[-1]
+                funcionamento[-1] = (anterior, max(fechamento, fecha))
+            else:
+                funcionamento.append((abre, fecha))
 
+        if not funcionamento:
+            return []
+        impedimentos = []
+        bloqueios = ((b.inicio, b.fim_efetivo) for b in self.bloqueios)
+        for de, ate in chain(ocupados, bloqueios):
+            trecho = _intersecao(inicio, fim, de, ate)
+            if trecho:
+                impedimentos.append(trecho)
+        impedimentos.sort()
+        livres = []
+        for cursor, fechamento in funcionamento:
+            for de, ate in impedimentos:
+                if de >= fechamento or cursor >= fechamento:
+                    break
+                if ate <= cursor:
+                    continue
+                if cursor < de:
+                    livres.append((cursor, de))
+                cursor = ate
+            if cursor < fechamento:
+                livres.append((cursor, fechamento))
+        return livres
 
-# =========================
-# EQUIPAMENTOS
-# =========================
+    def permite_periodo(self, inicio, fim):
+        return (inicio, fim) in self.horarios_livres(inicio, fim)
+
 
 class Equipamento:
     def __init__(self, id, nome, quantidade_total):
@@ -211,10 +247,6 @@ class SolicitacaoEquipamento:
         self.status = StatusSolicitacao.CANCELADA
 
 
-# =========================
-# QUADRA
-# =========================
-
 class Quadra:
     def __init__(self, id, nome, modalidade, capacidade,
                  valor_hora, supervisor):
@@ -225,7 +257,6 @@ class Quadra:
         self.supervisor = supervisor
         self.agenda = Agenda()
         self.equipamentos = []
-        # Limite por quadra, quando houver uma cota para o equipamento.
         self.estoque_equipamentos = {}
 
     def atualizar(self, nome, modalidade, capacidade):
@@ -243,6 +274,11 @@ class Quadra:
 
     def disponibilizar(self):
         self.ativa = True
+        # Revisão (João) — reabrir a quadra hoje também retira a interdição marcada para amanhã?
+        for bloqueio in self.agenda.bloqueios:
+            agora = datetime.now(bloqueio.inicio.tzinfo)
+            if bloqueio.fim_efetivo > agora:
+                bloqueio.liberado_em = agora
 
     def desativar(self):
         self.ativa = False
@@ -251,10 +287,6 @@ class Quadra:
         horas = Decimal(str((fim - inicio).total_seconds())) / Decimal("3600")
         return (self.valor_hora * horas).quantize(Decimal("0.01"))
 
-
-# =========================
-# PARTIDAS
-# =========================
 
 class Partida:
     def __init__(self, publica, limite_participantes):
@@ -296,10 +328,6 @@ class Partida:
         self.participantes_fechados = True
 
 
-# =========================
-# RESERVAS
-# =========================
-
 class Reserva:
     def __init__(self, id, inicio, fim, responsavel, quadra, modo=None):
         if modo not in (None, "integral", "rateado"):
@@ -313,7 +341,7 @@ class Reserva:
         self.status = StatusReserva.ATIVA
         self.responsavel = responsavel
         self.quadra = quadra
-        # Atualização 2 — partida privada com o responsável e a capacidade da quadra.
+        # Revisão (João) — a partida começa privada e já inclui quem fez a reserva?
         self.partida = Partida(False, quadra.capacidade)
         self.partida.autorizar_participante(responsavel)
         self.partida.adicionar_participante(responsavel)
@@ -323,14 +351,12 @@ class Reserva:
 
     @property
     def metodo_pagamento(self):
-        # Cadastros antigos só registravam o modo ao confirmar o primeiro débito.
         return getattr(self, "modo_contratado", None) or self.modo_pagamento
 
     def sobrepoe(self, inicio, fim):
         return (
-            self.inicio < fim
-            and self.fim > inicio
-            and self.status == StatusReserva.ATIVA
+            self.status == StatusReserva.ATIVA
+            and _intersecao(inicio, fim, self.inicio, self.fim) is not None
         )
 
     def quantidades_solicitadas(self):
@@ -340,7 +366,6 @@ class Reserva:
                 quantidades[pedido.equipamento] += pedido.quantidade
         return quantidades
 
-    # Atualização 3 — divide os centavos por ID, com sobra na ordem de inscrição.
     def calcular_rateio(self):
         return self._ratear_valor(self.valor_total)
 
@@ -350,6 +375,7 @@ class Reserva:
             return {}
         centavos = int(valor * 100)
         base, sobra = divmod(centavos, len(participantes))
+        # Revisão (João) — dois atletas com o mesmo nome continuam com parcelas separadas?
         return {
             atleta.id: Decimal(base + (indice < sobra)).scaleb(-2)
             for indice, atleta in enumerate(participantes)
@@ -376,12 +402,9 @@ class Reserva:
                 pedido.devolver()
             elif pedido.status == StatusSolicitacao.SOLICITADA:
                 pedido.cancelar()
+        self.partida.fechar_participantes()
         self.status = StatusReserva.CONCLUIDA
 
-
-# =========================
-# CARTEIRA E CRÉDITOS
-# =========================
 
 class Carteira:
     def __init__(self):
@@ -423,10 +446,6 @@ class CompraCredito:
             raise ValueError("Compra já processada.")
         self.status = StatusCompraCredito.CANCELADA
 
-
-# =========================
-# PAGAMENTOS E REPASSES
-# =========================
 
 class Pagamento:
     def __init__(self, id, valor, pagador, reserva):
@@ -473,10 +492,6 @@ class Repasse:
         self.status = StatusRepasse.EFETUADO
         self.efetuado_em = datetime.now()
 
-
-# =========================
-# DENUNCIAS E AVALIACOES
-# =========================
 
 class Denuncia:
     def __init__(self, id, motivo, autor, denunciado):
