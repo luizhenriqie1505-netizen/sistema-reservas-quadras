@@ -1,5 +1,10 @@
 
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime, timedelta, time
 from decimal import Decimal
@@ -460,6 +465,133 @@ class TestesSistemaReservas(unittest.TestCase):
         self.assertEqual((avaliacao.nota, avaliacao.comentario), (5, "Boa partida"))
         self.assertIsInstance(avaliacao.data, datetime)
         self.assertEqual(self.sistema.avaliacoes, [avaliacao])
+
+
+    def test_dados_proprios_e_desativacao_com_historico(self):
+        self.assertEqual(self.sistema.consultar_dados(self.supervisor, self.supervisor)["id"],
+                         self.supervisor.id)
+        with self.assertRaises(PermissionError):
+            self.sistema.consultar_dados(self.supervisor, self.atleta)
+        reserva = self.reservar()
+        self.sistema.excluir_quadra(self.supervisor, self.quadra)
+        self.assertFalse(self.quadra.ativa)
+        self.assertIn(self.quadra, self.sistema.quadras)
+        self.assertIn(reserva, self.sistema.reservas)
+        self.sistema.disponibilizar_quadra(self.supervisor, self.quadra)
+        self.assertTrue(self.quadra.ativa)
+
+    def test_limite_de_cancelamento_e_interdicao(self):
+        reserva = self.reservar()
+        self.atleta.carteira.creditar(100)
+        self.sistema.pagar_reserva(self.atleta, reserva)
+        with patch("servicos.datetime", wraps=datetime) as relogio:
+            relogio.now.return_value = self.inicio - timedelta(minutes=119)
+            with self.assertRaises(ValueError):
+                self.sistema.cancelar_reserva(self.atleta, reserva)
+            self.assertEqual(reserva.status, StatusReserva.ATIVA)
+            self.sistema.interditar_quadra(self.admin, self.quadra, self.inicio, self.fim, "Chuva")
+        self.assertEqual(self.atleta.carteira.saldo, 100)
+        self.assertEqual(reserva.status, StatusReserva.CANCELADA)
+
+    def test_cancelamento_com_duas_horas_exatas(self):
+        reserva = self.reservar()
+        with patch("servicos.datetime", wraps=datetime) as relogio:
+            relogio.now.return_value = self.inicio - timedelta(hours=2)
+            self.sistema.cancelar_reserva(self.atleta, reserva)
+        self.assertEqual(reserva.status, StatusReserva.CANCELADA)
+
+    def test_metodo_contratado_antes_do_primeiro_debito(self):
+        reserva = self.sistema.criar_reserva(self.atleta, self.quadra, self.inicio, self.fim, "rateado")
+        self.atleta.carteira.creditar(100)
+        with self.assertRaises(ValueError):
+            self.sistema.pagar_reserva(self.atleta, reserva, integral=True)
+        self.assertEqual(self.atleta.carteira.saldo, 100)
+        self.assertFalse(reserva.partida.participantes_fechados)
+
+    def test_convite_privado_lotacao_e_duplicidade(self):
+        self.sistema.atualizar_quadra(self.supervisor, self.quadra, "Dupla", "Tênis", 2)
+        reserva = self.reservar()
+        convidada = Atleta(4, "Beatriz", "bia@teste")
+        opcoes = self.sistema.consultar_opcoes_de_inscricao
+        self.assertNotIn(reserva, opcoes(convidada))
+        with self.assertRaises(PermissionError):
+            self.sistema.participar_partida(convidada, reserva)
+        self.sistema.autorizar_participante(self.atleta, reserva, convidada)
+        self.assertIn(reserva, opcoes(convidada))
+        self.sistema.participar_partida(convidada, reserva)
+        self.sistema.definir_privacidade(self.atleta, reserva, True)
+        self.assertNotIn(reserva.partida, self.sistema.consultar_partidas_publicas())
+        with self.assertRaises(ValueError):
+            self.sistema.participar_partida(convidada, reserva)
+        self.assertEqual(reserva.partida.participantes, [self.atleta, convidada])
+
+    def test_fornecimento_reconfere_estoque_no_periodo(self):
+        reserva = self.reservar()
+        bola = self.sistema.cadastrar_equipamento(self.supervisor, self.quadra, "Bola", 3)
+        primeiro = self.sistema.solicitar_equipamento(self.atleta, reserva, bola, 2)
+        segundo = self.sistema.solicitar_equipamento(self.atleta, reserva, bola, 1)
+        bola.atualizar_quantidade(-1)
+        with self.assertRaises(ValueError):
+            self.sistema.fornecer_equipamento(self.supervisor, reserva, segundo)
+        self.assertEqual(segundo.status, StatusSolicitacao.SOLICITADA)
+        self.assertEqual(bola.quantidade_total, 2)
+        primeiro.cancelar()
+        self.sistema.fornecer_equipamento(self.supervisor, reserva, segundo)
+        self.assertEqual(bola.quantidade_total, 1)
+
+
+class TesteTerminal(unittest.TestCase):
+    def test_apresentacao_interativa_dos_tres_perfis(self):
+        entradas = [
+            "2", "2", "leo@demo", "quadra", "10", "2", "11", "2", "5", "2", "0",
+            "2", "ana@demo", "quadra", "5", "2", "12", "2", "1", "1", "0",
+            "2", "bia@demo", "quadra", "12", "2", "1", "14", "1", "3", "5", "Pontual", "16", "0",
+            "2", "admin@demo", "quadra", "6", "2", "1", "0", "0",
+        ]
+        with tempfile.TemporaryDirectory() as pasta:
+            p = subprocess.run([sys.executable, str(Path(__file__).with_name("main.py"))],
+                               input="\n".join(entradas) + "\n", capture_output=True,
+                               encoding="utf-8", timeout=30, check=True,
+                               env={**os.environ, "LOCALAPPDATA": pasta, "PYTHONIOENCODING": "utf-8"})
+            self.assertNotIn("Operação recusada", p.stdout)
+            self.assertIn("Léo (ID 4): R$ 50.00", p.stdout)
+            self.assertEqual(p.stdout.count("Pagamento confirmado: R$ 50.00"), 2)
+            self.assertIn("Material fornecido: 1 x Bola.", p.stdout)
+            self.assertIn("Avaliação registrada para Ana: 5/5.", p.stdout)
+            self.assertIn("Repasse 1: R$ 100.00", p.stdout)
+            self.assertFalse(list(Path(pasta).rglob("*.sqlite3")))
+
+    def test_cadastro_login_reserva_e_reabertura(self):
+        data = (datetime.now() + timedelta(days=2)).strftime("%d/%m/%Y")
+        with tempfile.TemporaryDirectory() as pasta:
+            def executar(linhas):
+                resultado = subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name("main.py"))],
+                    input="\n".join(["1", *linhas]) + "\n", capture_output=True,
+                    encoding="utf-8", timeout=30, check=True,
+                    env={**os.environ, "LOCALAPPDATA": pasta, "PYTHONIOENCODING": "utf-8"},
+                )
+                return resultado.stdout
+
+            saida = executar([
+                "Admin", "admin@teste", "senha-a", "senha-a",
+                "2", "admin@teste", "senha-errada",
+                "2", "admin@teste", "senha-a", "1", "Supervisor", "sup@teste", "senha-s", "senha-s", "0",
+                "2", "sup@teste", "senha-s", "1", "Central", "Futsal", "10", "100",
+                "1 2 3 4 5 6 7", "08:00", "22:00", "0",
+                "1", "Atleta", "atleta@teste", "senha-t", "senha-t",
+                "2", "atleta@teste", "senha-t", "1", data, "19:00", "20:00", "1", "1",
+                "4", "150", "s", "5", "1", "0", "0",
+            ])
+            self.assertIn("E-mail ou senha inválidos", saida)
+            self.assertIn("Reserva 1 confirmada", saida)
+            self.assertIn("Pagamento confirmado", saida)
+            saida = executar(["2", "atleta@teste", "senha-t", "2", "3", "1", "0", "0"])
+            self.assertIn("1 - Central", saida)
+            self.assertIn("Saldo: R$ 50.00", saida)
+            self.assertIn("Reserva cancelada.", saida)
+            self.assertIn("Saldo: R$ 150.00", saida)
+            self.assertNotIn("Primeiro acesso", saida)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from modelos import (
     Administrador, Supervisor, Atleta, Quadra, Reserva,
-    Avaliacao, Pagamento, CompraCredito, Repasse,
+    Equipamento, Avaliacao, Pagamento, CompraCredito, Repasse,
     Denuncia, SolicitacaoEquipamento, Bloqueio
 )
 
@@ -47,7 +47,7 @@ class SistemaReservas:
     def consultar_dados(self, autor, usuario):
         self._exigir_conta_ativa(autor)
         if not autor.tem_permissao("consultar_dados") or (
-            isinstance(autor, Atleta) and autor != usuario
+            not isinstance(autor, Administrador) and autor != usuario
         ):
             raise PermissionError("Sem permissão.")
 
@@ -58,10 +58,14 @@ class SistemaReservas:
         if not isinstance(autor, Administrador):
             raise PermissionError("Somente administrador pode banir usuários.")
 
+        if isinstance(usuario, Administrador):
+            raise PermissionError("Selecione um atleta ou supervisor.")
         usuario.banir(motivo)
 
     def registrar_denuncia(self, autor, denunciado, motivo):
         self._exigir_conta_ativa(autor)
+        if not motivo or not motivo.strip():
+            raise ValueError("Informe o motivo da denúncia.")
         denuncia = Denuncia(
             len(self.denuncias) + 1,
             motivo,
@@ -85,7 +89,7 @@ class SistemaReservas:
             raise PermissionError("Somente supervisor pode cadastrar quadras.")
 
         quadra = Quadra(
-            len(self.quadras) + 1,
+            max((q.id for q in self.quadras), default=0) + 1,
             nome,
             modalidade,
             capacidade,
@@ -114,7 +118,8 @@ class SistemaReservas:
             raise PermissionError("Supervisor não autorizado.")
 
         if any(r.quadra == quadra for r in self.reservas):
-            raise ValueError("Quadra possui histórico de reservas.")
+            quadra.desativar()
+            return
 
         self.quadras.remove(quadra)
 
@@ -130,7 +135,7 @@ class SistemaReservas:
         if autor != quadra.supervisor:
             raise PermissionError("Supervisor não autorizado.")
 
-        return quadra.disponibilizar()
+        quadra.disponibilizar()
 
     def definir_disponibilidade(self, autor, quadra, faixas):
         self._exigir_conta_ativa(autor)
@@ -172,7 +177,7 @@ class SistemaReservas:
     # RESERVAS
     # =========================
 
-    def criar_reserva(self, autor, quadra, inicio, fim):
+    def criar_reserva(self, autor, quadra, inicio, fim, modo=None):
         self._exigir_conta_ativa(autor)
         if not isinstance(autor, Atleta):
             raise PermissionError("Somente atletas podem criar reservas.")
@@ -191,7 +196,8 @@ class SistemaReservas:
             inicio,
             fim,
             autor,
-            quadra
+            quadra,
+            modo
         )
 
         reserva.valor_total = quadra.calcular_valor(inicio, fim)
@@ -211,8 +217,11 @@ class SistemaReservas:
         if autor not in (reserva.responsavel, reserva.quadra.supervisor):
             raise PermissionError("Sem permissão para cancelar.")
 
-        if reserva.inicio <= datetime.now(reserva.inicio.tzinfo):
+        antecedencia = reserva.inicio - datetime.now(reserva.inicio.tzinfo)
+        if antecedencia <= timedelta(0):
             raise ValueError("Reserva já iniciada.")
+        if antecedencia < timedelta(hours=2):
+            raise ValueError("O cancelamento exige pelo menos duas horas de antecedência.")
         self._cancelar_com_estorno(reserva)
 
     def _pagamentos_ativos(self, reserva):
@@ -264,8 +273,7 @@ class SistemaReservas:
             elif diferenca < 0:
                 carteira.creditar(-diferenca)
             pagamento.valor = novo_valor
-        reserva.reagendar(inicio, fim)
-        reserva.valor_total = novo_total
+        reserva.reagendar(inicio, fim, novo_total)
 
     def calcular_rateio(self, reserva):
         if reserva.partida is None:
@@ -284,7 +292,7 @@ class SistemaReservas:
         # Atualização 4 — valida modo, pagador e saldo devido antes do débito.
         modo = "integral" if integral else "rateado"
         pagos = self._pagamentos_ativos(reserva)
-        if reserva.modo_pagamento not in (None, modo):
+        if reserva.metodo_pagamento not in (None, modo):
             raise ValueError("Modo de pagamento já definido.")
         if any(p.pagador.id == autor.id for p in pagos):
             raise ValueError("Pagamento já realizado.")
@@ -298,6 +306,8 @@ class SistemaReservas:
                 raise ValueError("Atleta não participa da partida.")
             valor = rateio[autor.id]
 
+        if valor == 0:
+            raise ValueError("Não há valor a pagar nesta parcela.")
         if valor + sum(p.valor for p in pagos) > reserva.valor_total:
             raise ValueError("Pagamento excede o total devido.")
 
@@ -338,13 +348,31 @@ class SistemaReservas:
 
         if reserva.partida is None:
             raise ValueError("Reserva ainda não possui partida.")
-
+        if not self._aceita_inscricao(reserva):
+            raise ValueError("Partida indisponível para convites.")
+        if not isinstance(atleta, Atleta) or atleta.banido:
+            raise ValueError("O convidado deve ser um atleta com conta ativa.")
+        if atleta in reserva.partida.participantes:
+            raise ValueError("Atleta já está na partida.")
         reserva.partida.autorizar_participante(atleta)
 
     def _aceita_inscricao(self, reserva):
-        return (reserva.status == StatusReserva.ATIVA
-                and reserva.inicio > datetime.now(reserva.inicio.tzinfo)
-                and not reserva.partida.participantes_fechados)
+        partida = reserva.partida
+        return (
+            reserva.status == StatusReserva.ATIVA
+            and reserva.inicio > datetime.now(reserva.inicio.tzinfo)
+            and not partida.participantes_fechados
+            and len(partida.participantes) < partida.limite_participantes
+        )
+
+    def consultar_opcoes_de_inscricao(self, atleta):
+        self._exigir_conta_ativa(atleta)
+        if not isinstance(atleta, Atleta):
+            raise PermissionError("Somente atletas podem se inscrever.")
+        return [reserva for reserva in self.reservas
+                if self._aceita_inscricao(reserva)
+                and atleta not in reserva.partida.participantes
+                and (reserva.partida.publica or atleta in reserva.partida.autorizados)]
 
     def consultar_partidas_publicas(self):
         return [
@@ -371,6 +399,24 @@ class SistemaReservas:
     # =========================
     # EQUIPAMENTOS
     # =========================
+
+    def cadastrar_equipamento(self, autor, quadra, nome, quantidade):
+        self._exigir_conta_ativa(autor)
+        if autor != quadra.supervisor:
+            raise PermissionError("Supervisor não autorizado.")
+        if type(quantidade) is not int or quantidade < 1:
+            raise ValueError("Estoque inicial deve ser um inteiro positivo.")
+        equipamento = Equipamento(len(quadra.equipamentos) + 1, nome, quantidade)
+        quadra.equipamentos.append(equipamento)
+        return equipamento
+
+    def concluir_reserva(self, autor, reserva):
+        self._exigir_conta_ativa(autor)
+        if autor != reserva.quadra.supervisor:
+            raise PermissionError("Supervisor não autorizado.")
+        if reserva.fim > datetime.now(reserva.fim.tzinfo):
+            raise ValueError("O horário da reserva ainda não terminou.")
+        reserva.concluir()
 
     def unidades_livres(self, quadra, equipamento, inicio, fim, *, ignorar=None):
         if inicio >= fim:
@@ -435,6 +481,11 @@ class SistemaReservas:
         if solicitacao not in reserva.solicitacoes:
             raise ValueError("Solicitação não pertence à reserva.")
 
+        equipamento = solicitacao.equipamento
+        livres = self.unidades_livres(reserva.quadra, equipamento, reserva.inicio,
+                                      reserva.fim, ignorar=reserva)
+        if reserva.quantidades_solicitadas()[equipamento] > livres:
+            raise ValueError("Estoque insuficiente no período da reserva.")
         solicitacao.fornecer()
 
     # =========================

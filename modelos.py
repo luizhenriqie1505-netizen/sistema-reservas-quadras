@@ -51,14 +51,15 @@ class Usuario(ABC):
             "id": self.id,
             "nome": self.nome,
             "email": self.email,
-            "banido": self.banido
+            "banido": self.banido,
+            "motivo_banimento": self._motivo_banimento
         }
 
     def banir(self, motivo):
-        if not motivo:
+        if not motivo or not motivo.strip():
             raise ValueError("Informe o motivo do banimento.")
         self._banido = True
-        self._motivo_banimento = motivo
+        self._motivo_banimento = motivo.strip()
 
 
 class Administrador(Usuario):
@@ -68,13 +69,13 @@ class Administrador(Usuario):
 
 class Supervisor(Usuario):
     def tem_permissao(self, acao):
-        return acao in [
-            "gerenciar_quadras",
-            "consultar_reservas",
-            "fornecer_equipamento",
-            "interditar_quadra",
-            "avaliar_atleta"
-        ]
+        return acao in {
+            "consultar_dados", "registrar_denuncia", "gerenciar_quadras", "cadastrar_quadra",
+            "atualizar_quadra", "excluir_quadra", "definir_preco", "disponibilizar_quadra",
+            "definir_disponibilidade", "consultar_disponibilidade", "consultar_reservas",
+            "consultar_partidas", "cancelar_reserva", "interditar_quadra", "concluir_reserva",
+            "cadastrar_equipamento", "fornecer_equipamento", "avaliar_atleta",
+        }
 
 
 class Atleta(Usuario):
@@ -87,14 +88,13 @@ class Atleta(Usuario):
         return self._carteira
 
     def tem_permissao(self, acao):
-        return acao in [
-            "consultar_dados",
-            "criar_reserva",
-            "cancelar_reserva",
-            "reagendar_reserva",
-            "participar_partida",
-            "solicitar_equipamento"
-        ]
+        return acao in {
+            "consultar_dados", "registrar_denuncia", "consultar_disponibilidade",
+            "criar_reserva", "cancelar_reserva", "reagendar_reserva", "definir_privacidade",
+            "calcular_rateio", "pagar_reserva", "comprar_creditos", "participar_partida",
+            "autorizar_participante", "consultar_partidas", "consultar_partidas_publicas",
+            "solicitar_equipamento",
+        }
 
 
 # =========================
@@ -219,9 +219,7 @@ class Quadra:
     def __init__(self, id, nome, modalidade, capacidade,
                  valor_hora, supervisor):
         self.id = id
-        self.nome = nome
-        self.modalidade = modalidade
-        self.capacidade = capacidade
+        self.atualizar(nome, modalidade, capacidade)
         self.ativa = True
         self.definir_preco(valor_hora)
         self.supervisor = supervisor
@@ -231,23 +229,23 @@ class Quadra:
         self.estoque_equipamentos = {}
 
     def atualizar(self, nome, modalidade, capacidade):
+        if type(capacidade) is not int or capacidade < 1:
+            raise ValueError("A capacidade deve ser um inteiro positivo.")
         self.nome = nome
         self.modalidade = modalidade
         self.capacidade = capacidade
 
     def definir_preco(self, valor):
         valor = Decimal(str(valor))
-        if valor < 0:
-            raise ValueError("Preço não pode ser negativo.")
+        if not valor.is_finite() or valor < 0:
+            raise ValueError("Informe um preço válido.")
         self.valor_hora = valor
 
     def disponibilizar(self):
         self.ativa = True
-        return self.ativa
 
     def desativar(self):
         self.ativa = False
-        return self.ativa
 
     def calcular_valor(self, inicio, fim):
         horas = Decimal(str((fim - inicio).total_seconds())) / Decimal("3600")
@@ -277,14 +275,16 @@ class Partida:
         if self.participantes_fechados:
             raise ValueError("Lista de participantes fechada.")
 
+        if any(inscrito.id == atleta.id for inscrito in self.participantes):
+            raise ValueError("Atleta já está na partida.")
+
         if len(self.participantes) >= self.limite_participantes:
             raise ValueError("Partida lotada.")
 
         if not self.publica and atleta not in self.autorizados:
             raise PermissionError("Atleta não autorizado.")
 
-        if atleta not in self.participantes:
-            self.participantes.append(atleta)
+        self.participantes.append(atleta)
 
     def remover_participante(self, atleta):
         if self.participantes_fechados:
@@ -301,7 +301,11 @@ class Partida:
 # =========================
 
 class Reserva:
-    def __init__(self, id, inicio, fim, responsavel, quadra):
+    def __init__(self, id, inicio, fim, responsavel, quadra, modo=None):
+        if modo not in (None, "integral", "rateado"):
+            raise ValueError("Modo de pagamento inválido.")
+        if inicio >= fim:
+            raise ValueError("O início deve ser anterior ao fim.")
         self.id = id
         self.inicio = inicio
         self.fim = fim
@@ -313,11 +317,14 @@ class Reserva:
         self.partida = Partida(False, quadra.capacidade)
         self.partida.autorizar_participante(responsavel)
         self.partida.adicionar_participante(responsavel)
+        self.modo_contratado = modo
         self.modo_pagamento = None
         self.solicitacoes = []
 
-        if inicio >= fim:
-            raise ValueError("O início deve ser anterior ao fim.")
+    @property
+    def metodo_pagamento(self):
+        # Cadastros antigos só registravam o modo ao confirmar o primeiro débito.
+        return getattr(self, "modo_contratado", None) or self.modo_pagamento
 
     def sobrepoe(self, inicio, fim):
         return (
@@ -348,11 +355,13 @@ class Reserva:
             for indice, atleta in enumerate(participantes)
         }
 
-    def reagendar(self, inicio, fim):
+    def reagendar(self, inicio, fim, valor=None):
         if inicio >= fim:
             raise ValueError("O início deve ser anterior ao fim.")
         self.inicio = inicio
         self.fim = fim
+        if valor is not None:
+            self.valor_total = valor
 
     def cancelar(self):
         if self.status != StatusReserva.ATIVA:
@@ -395,6 +404,8 @@ class CompraCredito:
     def __init__(self, id, valor, carteira):
         self.id = id
         self.valor = Decimal(str(valor))
+        if not self.valor.is_finite() or self.valor <= 0:
+            raise ValueError("O valor da compra deve ser positivo.")
         self.status = StatusCompraCredito.PENDENTE
         self.criada_em = datetime.now()
         self.confirmada_em = None
